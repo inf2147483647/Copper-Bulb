@@ -1,118 +1,36 @@
-# 插件自述文件
+# 铜灯
 
-本文件会在插件市场上显示。在安装插件后，本自述文件也会在【应用设置】->【插件】页面中显示。因此，本文件也将会是用户了解你的插件功能的重要途径，建议好好写 README。
+受 Minecraft 铜灯启发的自动化**条件**插件：它像一个由红石控制的 T 触发器（Toggle Flip-flop），把"信号脉冲"变成状态的翻转与保持。
 
-**注意事项：**
+## 功能
 
-- 嵌入图片时请使用网络图床。
-- 支持在这里直接调用 ClassIsland 内部的 Uri，例如[classisland://app/test/](classisland://app/test/)。
-- 本文件一般会在 ClassIsland 内置的 Markdown 渲染器（基于 [MdXaml](https://github.com/whistyun/MdXaml)）中渲染，仅支持部分 Markdown 语法。
+在【应用设置】->【自动化】-> 规则集中，条件列表里会出现 **铜灯** 条件。
 
-***
+- 每个铜灯内部可以添加任意其他自动化条件（支持嵌套，铜灯里还能放铜灯）。
+- 当内部条件**从不满足变为满足**时（相当于收到一个红石脉冲），铜灯在"点亮"和"熄灭"之间翻转一次。
+- 当内部条件**从满足变回不满足**时，铜灯**不翻转**，保持当前状态。
+- 点亮状态会持久化保存，重启 ClassIsland 后依然保持。
 
-**支持的 Markdown 语法：**
+## 使用方法
 
-> 本示例魔改自 [Leanote 博客](http://leanote.leanote.com/post/markdown-source-code)。
+1. 打开【自动化】，新建或编辑一个工作流的触发规则。
+2. 添加条件 **铜灯**。
+3. 在铜灯的设置中，往内部规则集添加其他条件（例如"上课中"、"时间范围"等）。
+4. 将铜灯与其他条件组合（与/或），或直接用铜灯作为触发条件的一部分。
 
-# Welcome to ClassIsland! 欢迎来到ClassIsland!
- 
-## 1. 排版
- 
-**粗体** *斜体* 
- 
-~~这是一段错误的文本。~~
- 
-引用:
- 
-> 123123123123
- 
-有充列表:
- 1. 支持Vim
- 2. 支持Emacs
- 
-无序列表:
- 
- - 项目1
- - 项目2
- 
- 
-## 2. 图片与链接
- 
-网络图片:
-![Banner](https://github.com/user-attachments/assets/a815dd7d-8343-4da5-aee4-3f754aa297e4)
+**示例**：内部条件放"上课中"。第一节课开始时铜灯点亮；下课（条件不满足）不翻转；第二节课开始（再次满足，产生上升沿）铜灯熄灭。如此交替，可用于双周轮换、单双日切换等场景。
 
-WPF 资源图片：
+## 与 Minecraft 铜灯的对应关系
 
-![1690356161339](pack://application:,,,/ClassIsland;component/Assets/AppLogo.png)
+|Minecraft | 铜灯插件 |
+|--------|---|
+| 红石脉冲信号 | 内部条件 不满足 → 满足 |
+| 灯状态翻转并保持 | 点亮/熄灭 翻转并持久化 |
+| 信号消失不改变状态 | 满足 → 不满足 时不翻转 |
 
-链接:
- 
-[ClassIsland 官网](http://classisland.tech)
- 
-## 3. 标题
- 
-以下是各级标题, 最多支持5级标题
- 
-```
-# h1
-## h2
-### h3
-#### h4
-##### h4
-###### h5
-```
- 
-## 4. 代码
- 
-示例:
- 
-    function get(key) {
-        return m[key];
-    }
-    
-代码高亮示例:
- 
-``` javascript
-/**
-* nth element in the fibonacci series.
-* @param n >= 0
-* @return the nth element, >= 0.
-*/
-function fib(n) {
-  var a = 1, b = 1;
-  var tmp;
-  while (--n >= 0) {
-    tmp = a;
-    a += b;
-    b = tmp;
-  }
-  return a;
-}
- 
-document.write(fib(10));
-```
- 
-```python
-class Employee:
-   empCount = 0
- 
-   def __init__(self, name, salary):
-        self.name = name
-        self.salary = salary
-        Employee.empCount += 1
-```
- 
-# 5. Markdown 扩展
- 
-Markdown 扩展支持:
- 
-* 表格
- 
-## 5.1 表格
- 
-Item     | Value
--------- | ---
-Computer | \$1600
-Phone    | \$12
-Pipe     | \$1
- 
+## 说明
+
+- 内部条件状态每秒检测一次，翻转发生在状态变化的下一秒。
+- 与 ExtraIsland 等其他插件兼容，加载顺序不会互相影响。
+
+作者：inf2147483647
