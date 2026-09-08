@@ -17,7 +17,7 @@ public class Plugin : PluginBase
             CopperBulbService.RuleId,
             "铜灯",
             "\uEA63",
-            settings => settings is CopperBulbRuleSettings s && CopperBulbService.GetIsOn(s));
+            CopperBulbService.Handle);
 
         services.AddHostedService<CopperBulbService>();
     }

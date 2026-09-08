@@ -8,13 +8,15 @@ using Microsoft.Extensions.Hosting;
 namespace Copper_Bulb.Automation;
 
 /// <summary>
-/// 铜灯条件服务：周期性轮询所有“铜灯”内部的规则集，
-/// 当内部条件的判定结果发生变化时，像 T 触发器一样翻转铜灯的点亮状态。
-/// </summary>
-public class CopperBulbService : IHostedService
+    /// 铜灯条件服务：驱动计时器做扫描与持久化；
+    /// 铜灯状态的边沿翻转统一在规则处理程序 <see cref="Handle"/> 中完成，
+    /// 以便任意承载规则集的地方（组件隐藏条件、窗口规则、自动化工作流等）
+    /// 都能在宿主求值时检测内部条件边沿并翻转。
+    /// </summary>
+    public class CopperBulbService : IHostedService
 {
     /// <summary>
-    /// “铜灯”规则的 ID。
+    /// "铜灯"规则的 ID。
     /// </summary>
     public const string RuleId = "copper_bulb.bulb";
 
@@ -24,9 +26,12 @@ public class CopperBulbService : IHostedService
     public static CopperBulbService? Instance { get; private set; }
 
     private readonly Dictionary<Guid, CopperBulbRuleSettings> _bulbs = new();
+    private readonly object _bulbsLock = new();
     private DispatcherTimer? _timer;
     private IRulesetService? _rulesetService;
     private IAutomationService? _automationService;
+    private bool _dirty;
+    [ThreadStatic] private static int _evalDepth;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -69,7 +74,7 @@ public class CopperBulbService : IHostedService
                 return;
 
             Scan();
-            Poll();
+            FlushDirty();
         }
         catch
         {
@@ -78,26 +83,18 @@ public class CopperBulbService : IHostedService
     }
 
     /// <summary>
-    /// 扫描自动化工作流（含铜灯内嵌规则集），收集所有铜灯设置实例
-    /// （并把 JsonElement 反序列化回活对象以便持久化状态）。
+    /// 扫描自动化工作流（含铜灯内嵌规则集），把 JsonElement 设置反序列化为活对象，
+    /// 便于在保存自动化配置时把点亮状态一并持久化。
     /// </summary>
     private void Scan()
     {
-        var found = new HashSet<CopperBulbRuleSettings>(ReferenceEqualityComparer.Instance);
-
         foreach (var workflow in _automationService!.Workflows)
         {
-            ScanRuleset(workflow.Ruleset, found);
-        }
-
-        foreach (var (id, settings) in _bulbs.ToList())
-        {
-            if (!found.Contains(settings))
-                _bulbs.Remove(id);
+            ScanRuleset(workflow.Ruleset);
         }
     }
 
-    private void ScanRuleset(Ruleset ruleset, HashSet<CopperBulbRuleSettings> found)
+    private void ScanRuleset(Ruleset ruleset)
     {
         foreach (var group in ruleset.Groups)
         {
@@ -106,9 +103,9 @@ public class CopperBulbService : IHostedService
                 if (rule.Id != RuleId) continue;
                 var settings = EnsureLiveSettings(rule);
                 if (settings == null) continue;
-                RegisterBulb(settings, found);
+                RegisterBulb(settings);
                 // 递归扫描铜灯内部的条件，支持铜灯嵌套。
-                ScanRuleset(settings.InternalRuleset, found);
+                ScanRuleset(settings.InternalRuleset);
             }
         }
     }
@@ -145,58 +142,110 @@ public class CopperBulbService : IHostedService
         }
     }
 
-    private void RegisterBulb(CopperBulbRuleSettings s, HashSet<CopperBulbRuleSettings> found)
+    private void RegisterBulb(CopperBulbRuleSettings s)
     {
-        found.Add(s);
-        if (_bulbs.TryGetValue(s.Id, out var existing))
+        lock (_bulbsLock)
         {
-            if (ReferenceEquals(existing, s)) return;
-            // 复制规则组会导致两份设置共享同一 Id，为后到者重新分配，避免双重翻转。
-            s.Id = Guid.NewGuid();
+            if (_bulbs.TryGetValue(s.Id, out var existing))
+            {
+                if (ReferenceEquals(existing, s)) return;
+                // 复制规则组会导致两份设置共享同一 Id，为后到者重新分配，避免双重翻转。
+                s.Id = Guid.NewGuid();
+            }
+            _bulbs[s.Id] = s;
         }
-
-        _bulbs[s.Id] = s;
     }
 
     /// <summary>
-    /// 轮询每个铜灯的内部条件：首次只同步基线；之后仅当内部条件
-    /// 从不满足变为满足（上升沿）时翻转点亮状态，从满足变为不满足时不翻转。
+    /// 取（或注册）某个 Id 对应的稳定活对象，供任意规则集场景复用锁存状态。
     /// </summary>
-    private void Poll()
+    private CopperBulbRuleSettings GetOrAddLive(CopperBulbRuleSettings s)
     {
-        var flipped = false;
-        foreach (var s in _bulbs.Values.ToList())
+        lock (_bulbsLock)
         {
-            var inner = _rulesetService!.IsRulesetSatisfied(s.InternalRuleset);
-            if (s.LastInnerState == null)
+            if (_bulbs.TryGetValue(s.Id, out var existing))
+                return existing;
+            _bulbs[s.Id] = s;
+            return s;
+        }
+    }
+
+    private void MarkDirty() => _dirty = true;
+
+    /// <summary>
+    /// 把“已翻转”状态写回自动化配置并通知宿主刷新（由 1 秒计时段触发，
+    /// 避免在规则求值过程中调用 SaveConfig 造成重入问题）。
+    /// </summary>
+    private void FlushDirty()
+    {
+        if (!_dirty || _automationService == null || _rulesetService == null) return;
+        _dirty = false;
+        try
+        {
+            _automationService.SaveConfig("铜灯状态改变。");
+            _rulesetService.NotifyStatusChanged();
+        }
+        catch
+        {
+            _dirty = true; // 下个 tick 重试
+        }
+    }
+
+    /// <summary>
+    /// "铜灯"规则处理程序：每次宿主求值承载它的规则集时会被调用——
+    /// 先求值内部规则集（同时刷新内部条件的状态指示点），
+    /// 再检测内部条件“不满足→满足”的上升沿并翻转点亮状态，
+    /// 最后返回铜灯当前点亮状态。
+    /// 这样在任何规则集场景下都能按 T 触发器语义工作。
+    /// </summary>
+    public static bool Handle(object? settings)
+    {
+        if (settings is not CopperBulbRuleSettings s) return false;
+        if (++_evalDepth > 64) // 防御极端嵌套/自引用
+        {
+            _evalDepth--;
+            return s.IsOn;
+        }
+        try
+        {
+            var inst = Instance;
+            if (inst == null) return s.IsOn;
+
+            var rs = inst._rulesetService ?? IAppHost.TryGetService<IRulesetService>();
+            if (rs == null) return GetIsOnValue(s);
+
+            var live = inst.GetOrAddLive(s);
+            var inner = rs.IsRulesetSatisfied(live.InternalRuleset);
+
+            if (live.LastInnerState == null)
             {
-                s.LastInnerState = inner;
-                continue;
+                live.LastInnerState = inner; // 首次只建立基线，不翻转
+            }
+            else
+            {
+                var prev = live.LastInnerState.Value;
+                live.LastInnerState = inner;
+                if (!prev && inner) // 上升沿：不满足→满足
+                {
+                    live.IsOn = !live.IsOn;
+                    inst.MarkDirty();
+                }
             }
 
-            var prev = s.LastInnerState.Value;
-            s.LastInnerState = inner;
-            if (prev || !inner) continue;
-            s.IsOn = !s.IsOn;
-            flipped = true;
+            return live.IsOn;
         }
-
-        if (flipped)
+        finally
         {
-            _automationService!.SaveConfig("铜灯状态改变。");
-            _rulesetService!.NotifyStatusChanged();
+            _evalDepth--;
         }
     }
 
-    /// <summary>
-    /// 读取铜灯当前点亮状态。优先取运行时注册表中的活对象，回退到设置中保存的值。
-    /// </summary>
-    public static bool GetIsOn(CopperBulbRuleSettings s)
+    private static bool GetIsOnValue(CopperBulbRuleSettings s)
     {
         var inst = Instance;
         if (inst != null)
         {
-            lock (inst._bulbs)
+            lock (inst._bulbsLock)
             {
                 if (inst._bulbs.TryGetValue(s.Id, out var live))
                     return live.IsOn;
