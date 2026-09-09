@@ -12,6 +12,9 @@ public class Plugin : PluginBase
 {
     public override void Initialize(HostBuilderContext context, IServiceCollection services)
     {
+        // 给铜灯服务注入插件私有配置目录，用于跨重启持久化锁存状态（与宿主容器无关）。
+        CopperBulbService.PluginConfigFolder = PluginConfigFolder;
+
         // “铜灯”条件：内部条件从不满足变为满足时，像 T 触发器一样翻转点亮/熄灭状态；变回不满足时不翻转。
         services.AddRule<CopperBulbRuleSettings, CopperBulbRuleSettingsControl>(
             CopperBulbService.RuleId,

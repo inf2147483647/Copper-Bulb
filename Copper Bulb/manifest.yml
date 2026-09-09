@@ -7,8 +7,8 @@ id: Copper_Bulb
 name: 铜灯
 description: 插件描述
 entranceAssembly: "Copper_Bulb.dll"
-url: https://github.com/inf2147483647/Copper%20Bulb
-version: 2.0.0.0
+url: https://github.com/inf2147483647/Copper-Bulb
+version: 2.0.0.2
 apiVersion: 2.0.0.0
 author: inf2147483647
 icon: icon.png
