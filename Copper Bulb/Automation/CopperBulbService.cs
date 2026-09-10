@@ -49,6 +49,15 @@ namespace Copper_Bulb.Automation;
     private int _restoreDone; // 0=未广播，1=已广播；保证“恢复后广播”整体恰好一次
     [ThreadStatic] private static int _evalDepth;
 
+    /// <summary>
+    /// 在宿主调用线程上的最大内联递归深度。超过该深度后，铜灯内层规则集的求值
+    /// 会离栈切换到大栈后台线程执行，避免深嵌套时在调用线程上发生不可捕获的
+    /// StackOverflowException（进程直接崩溃）。
+    /// </summary>
+    private const int MaxInlineDepth = 8;
+
+    private static readonly BigStackEvaluator LazyBigStack = new();
+
     private string? StorePath =>
         string.IsNullOrEmpty(PluginConfigFolder)
             ? null
@@ -61,6 +70,71 @@ namespace Copper_Bulb.Automation;
     {
         public bool IsOn { get; set; }
         public bool? LastInnerState { get; set; }
+    }
+
+    /// <summary>
+    /// 专用大栈求值线程：当铜灯嵌套较深时，把内层规则集求值切换到该线程执行。
+    /// 线程栈（64MB）足以容纳大量嵌套层级，从而把“深递归”从小的调用线程栈上挪走。
+    /// 同一时刻串行处理请求；仅在求值期间阻塞发起方，语义与直接调用等价。
+    /// </summary>
+    private sealed class BigStackEvaluator
+    {
+        private readonly object _sync = new();
+        private readonly Queue<(Func<bool> Job, TaskCompletionSource<bool> Tcs)> _queue = new();
+        private readonly Thread _worker;
+
+        public BigStackEvaluator()
+        {
+            _worker = new Thread(Loop, 64 * 1024 * 1024)
+            {
+                IsBackground = true,
+                Name = "CopperBulbEval"
+            };
+            _worker.Start();
+        }
+
+        /// <summary>
+        /// 在调用线程上阻塞执行 <paramref name="job"/>。若调用方本身就是大栈线程
+        /// （说明正处于深嵌套递归中），则直接内联执行，避免重新排队造成死锁。
+        /// </summary>
+        public bool Run(Func<bool> job)
+        {
+            if (Thread.CurrentThread == _worker)
+                return job(); // 已在大栈线程上，直接递归（本线程栈足够大）
+
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_sync)
+            {
+                _queue.Enqueue((job, tcs));
+                Monitor.Pulse(_sync);
+            }
+            return tcs.Task.GetAwaiter().GetResult();
+        }
+
+        private void Loop()
+        {
+            for (;;)
+            {
+                (Func<bool> Job, TaskCompletionSource<bool> Tcs) item;
+                lock (_sync)
+                {
+                    while (_queue.Count == 0)
+                        Monitor.Wait(_sync);
+                    item = _queue.Dequeue();
+                }
+
+                bool result;
+                try
+                {
+                    result = item.Job();
+                }
+                catch
+                {
+                    result = false;
+                }
+                item.Tcs.TrySetResult(result);
+            }
+        }
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -269,7 +343,12 @@ namespace Copper_Bulb.Automation;
             if (rs == null)
                 return live.IsOn;
 
-            var inner = rs.IsRulesetSatisfied(live.InternalRuleset);
+            // 深嵌套时离栈到大栈线程求值内层规则集，避免在调用线程上递归过深导致
+            // 不可捕获的 StackOverflowException（进程崩溃）。浅嵌套时仍直接内联，
+            // 不给常见场景增加线程切换开销。
+            var inner = _evalDepth > MaxInlineDepth
+                ? LazyBigStack.Run(() => rs.IsRulesetSatisfied(live.InternalRuleset))
+                : rs.IsRulesetSatisfied(live.InternalRuleset);
 
             var flipped = false;
             if (live.LastInnerState == null)

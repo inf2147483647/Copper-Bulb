@@ -2,6 +2,8 @@ using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Styling;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Controls.Ruleset;
 
@@ -13,6 +15,14 @@ namespace Copper_Bulb.Automation;
 /// </summary>
 public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbRuleSettings>
 {
+    /// <summary>
+    /// 深色主题下 FluentAvalonia 的卡片背景随嵌套逐层变白，超过约 32 层后
+    /// 背景已接近纯白、浅色文字不可读。超过该层级的铜灯文本改为黑色，
+    /// 较浅层不受影响。
+    /// </summary>
+    private const int DarkTextNestingThreshold = 32;
+
+    private readonly TextBlock _titleText;
     private readonly RulesetControl _rulesetControl = new() { ShowTitle = false };
 
     public CopperBulbRuleSettingsControl()
@@ -24,10 +34,11 @@ public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbR
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
 
-        panel.Children.Add(new TextBlock
+        _titleText = new TextBlock
         {
             Text = "铜灯内部条件（内部条件从不满足变为满足时，铜灯状态翻转）："
-        });
+        };
+        panel.Children.Add(_titleText);
         panel.Children.Add(_rulesetControl);
 
         Content = new ScrollViewer
@@ -45,5 +56,34 @@ public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbR
     {
         if (Settings == null) return;
         _rulesetControl.Ruleset = Settings.InternalRuleset;
+
+        var depth = NestingDepth();
+
+        // 在标题中显示本卡片所在的嵌套深度（最外层铜灯为 1，向内逐层加 1）。
+        _titleText.Text = $"铜灯内部条件（嵌套深度 {depth + 1}）（内部条件从不满足变为满足时，铜灯状态翻转）：";
+
+        // 深色主题且嵌套超过 32 层时，卡片背景已接近纯白，浅色文字不可读，
+        // 将本层铜灯的文本设为黑色；浅层铜灯不做任何改动。
+        // 本地值优先级高于主题样式，确保覆盖 FluentAvalonia 的文字颜色。
+        var isDark = TopLevel.GetTopLevel(this)?.ActualThemeVariant == ThemeVariant.Dark;
+        if (isDark && depth >= DarkTextNestingThreshold)
+            _titleText.Foreground = Brushes.Black;
+    }
+
+    /// <summary>
+    /// 本控件在铜灯嵌套中的层级：沿可视树向上统计祖先“铜灯”设置控件的数量。
+    /// 最外层铜灯为 0，每向内嵌套一层加 1。
+    /// </summary>
+    private int NestingDepth()
+    {
+        var depth = 0;
+        Control? cur = this;
+        while (cur != null)
+        {
+            cur = cur.Parent as Control;
+            if (cur is CopperBulbRuleSettingsControl)
+                depth++;
+        }
+        return depth;
     }
 }
