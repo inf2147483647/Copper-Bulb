@@ -16,6 +16,13 @@ public class CopperBulbRuleSettings
     public Guid Id { get; set; } = Guid.NewGuid();
 
     /// <summary>
+    /// 铜灯名称：全局唯一，不可重名。
+    /// 新建时默认分配 "新铜灯 {N}"（N 为分配序号，单调递增、删除不回收）。
+    /// 空值会在控件加载时由服务自动补分配。
+    /// </summary>
+    public string Name { get; set; } = "";
+
+    /// <summary>
     /// 铜灯内部的判定条件（规则集）。
     /// </summary>
     public Ruleset InternalRuleset { get; set; } = new();

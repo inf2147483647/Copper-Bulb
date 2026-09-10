@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.IO;
+using System.Numerics;
 using System.Text.Json;
 using Avalonia.Threading;
 using ClassIsland.Core.Abstractions.Services;
@@ -35,7 +37,12 @@ namespace Copper_Bulb.Automation;
     /// </summary>
     public static string? PluginConfigFolder { get; set; }
 
-    private readonly Dictionary<Guid, CopperBulbRuleSettings> _bulbs = new();
+    /// <summary>
+    /// 铜灯活对象注册表。弱引用登记：强引用由宿主配置树持有，宿主中删除铜灯后
+    /// 其设置对象失去引用、被 GC 回收，本表条目随之失效并在下次访问时剔除，
+    /// 名称占用自动释放（默认名称的分配序号仍不回收）。
+    /// </summary>
+    private readonly Dictionary<Guid, WeakReference<CopperBulbRuleSettings>> _bulbs = new();
     private readonly object _bulbsLock = new();
     private readonly Dictionary<string, PersistedState> _store = new();
     private readonly object _storeLock = new();
@@ -62,6 +69,24 @@ namespace Copper_Bulb.Automation;
         string.IsNullOrEmpty(PluginConfigFolder)
             ? null
             : Path.Combine(PluginConfigFolder, "copper_bulb_state.json");
+
+    private string? CounterPath =>
+        string.IsNullOrEmpty(PluginConfigFolder)
+            ? null
+            : Path.Combine(PluginConfigFolder, "copper_bulb_counter.txt");
+
+    /// <summary>
+    /// 名称分配序号的持久化锁与内存值。<see cref="_nextIndex"/> 单调递增，
+    /// 删除铜灯不回收已分配的序号，保证默认名称永不重号。
+    /// </summary>
+    private readonly object _nameLock = new();
+    private BigInteger _nextIndex = 1;
+    private bool _counterLoaded;
+
+    /// <summary>
+    /// 默认名称格式。
+    /// </summary>
+    public const string DefaultNamePrefix = "新铜灯 ";
 
     /// <summary>
     /// 持久化的铜灯状态（以 Id 的字符串为键）。
@@ -206,7 +231,7 @@ namespace Copper_Bulb.Automation;
         {
             lock (_storeLock)
             {
-                foreach (var live in _bulbs.Values)
+                foreach (var live in AliveBulbs())
                 {
                     if (_store.TryGetValue(live.Id.ToString(), out var st)
                         && (live.IsOn != st.IsOn || live.LastInnerState != st.LastInnerState))
@@ -220,6 +245,29 @@ namespace Copper_Bulb.Automation;
 
         // 延迟给宿主组件完成订阅留足时间；由 _restoreDone 保证整体恰好一次。
         EnsureRestoreBroadcast(800);
+    }
+
+    /// <summary>
+    /// 返回注册表中仍存活（未被 GC 回收）的铜灯快照，并顺带剔除已失效的弱引用条目。
+    /// 调用方须持有 <see cref="_bulbsLock"/>。
+    /// </summary>
+    private List<CopperBulbRuleSettings> AliveBulbs()
+    {
+        var list = new List<CopperBulbRuleSettings>();
+        List<Guid>? dead = null;
+        foreach (var (id, wr) in _bulbs)
+        {
+            if (wr.TryGetTarget(out var live))
+                list.Add(live);
+            else
+                (dead ??= new List<Guid>()).Add(id);
+        }
+        if (dead != null)
+        {
+            foreach (var id in dead)
+                _bulbs.Remove(id);
+        }
+        return list;
     }
 
     /// <summary>
@@ -284,15 +332,19 @@ namespace Copper_Bulb.Automation;
     /// <summary>
     /// 取（或注册）某个 Id 对应的稳定活对象，供任意规则集场景复用锁存状态。
     /// 首次遇到时把插件持久化的状态覆盖到活对象上，保证重启后延续。
+    /// 注册采用弱引用；若宿主已换用新的设置对象实例，则改指向新实例，
+    /// 避免注册表持有的是宿主即将回收的旧对象。
     /// </summary>
     private CopperBulbRuleSettings GetOrAddLive(CopperBulbRuleSettings s)
     {
         lock (_bulbsLock)
         {
-            if (!_bulbs.TryGetValue(s.Id, out var live))
+            if (!_bulbs.TryGetValue(s.Id, out var wr)
+                || !wr.TryGetTarget(out var live)
+                || !ReferenceEquals(live, s))
             {
                 live = s;
-                _bulbs[s.Id] = live;
+                _bulbs[s.Id] = new WeakReference<CopperBulbRuleSettings>(live);
             }
 
             // 以插件自持状态为准，覆盖宿主配置里可能过期的副本。
@@ -443,5 +495,184 @@ namespace Copper_Bulb.Automation;
                     // 广播失败不影响状态本身。
                 }
             });
+    }
+
+    /// <summary>
+    /// 注册铜灯活对象（供设置界面在宿主求值前参与名称唯一性校验）。
+    /// 若该 Id 尚未登记、或原登记对象已被回收，则以当前实例登记弱引用。
+    /// </summary>
+    public void Register(CopperBulbRuleSettings s)
+    {
+        lock (_bulbsLock)
+        {
+            if (_bulbs.TryGetValue(s.Id, out var wr) && wr.TryGetTarget(out var live)
+                && ReferenceEquals(live, s))
+                return;
+            _bulbs[s.Id] = new WeakReference<CopperBulbRuleSettings>(s);
+        }
+    }
+
+    /// <summary>
+    /// 收集当前已注册活对象中除 <paramref name="excludeId"/> 外的全部名称。
+    /// 用于重名校验。
+    /// </summary>
+    private HashSet<string> ExistingNames(Guid excludeId)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        lock (_bulbsLock)
+        {
+            foreach (var b in AliveBulbs())
+            {
+                if (b.Id == excludeId) continue;
+                if (!string.IsNullOrWhiteSpace(b.Name))
+                    names.Add(b.Name);
+            }
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// 为尚未命名的铜灯分配默认名称 "新铜灯 {N}"。N 取自单调递增序号，
+    /// 若与已有名称冲突则继续递增直到不冲突。已命名则原样返回。
+    /// </summary>
+    public string EnsureName(CopperBulbRuleSettings s)
+    {
+        if (!string.IsNullOrWhiteSpace(s.Name))
+            return s.Name;
+
+        lock (_nameLock)
+        {
+            EnsureCounterLoaded();
+            var taken = ExistingNames(s.Id);
+            while (true)
+            {
+                var candidate = DefaultNamePrefix + _nextIndex.ToString(CultureInfo.InvariantCulture);
+                _nextIndex += 1;
+                if (!taken.Contains(candidate))
+                {
+                    s.Name = candidate;
+                    SaveCounter();
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 尝试重命名铜灯：名称非空且不与其它铜灯重名时应用并返回 true。
+    /// </summary>
+    public bool TryRename(CopperBulbRuleSettings s, string name)
+    {
+        var trimmed = name?.Trim() ?? "";
+        if (trimmed.Length == 0)
+            return false;
+        lock (_nameLock)
+        {
+            if (ExistingNames(s.Id).Contains(trimmed))
+                return false;
+            s.Name = trimmed;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 当前所有已注册铜灯的名称快照（已排序），供设置界面的下拉搜索框使用。
+    /// </summary>
+    public List<string> BulbNames()
+    {
+        var names = new List<string>();
+        lock (_bulbsLock)
+        {
+            foreach (var b in AliveBulbs())
+            {
+                if (!string.IsNullOrWhiteSpace(b.Name))
+                    names.Add(b.Name);
+            }
+        }
+        names.Sort(StringComparer.Ordinal);
+        return names;
+    }
+
+    /// <summary>
+    /// 按名称翻转指定铜灯的点亮状态；找不到该名称时返回 false。
+    /// 与条件翻转共用同一持久化与广播链路，保证状态落盘并让元件重估。
+    /// </summary>
+    public bool FlipByName(string name)
+    {
+        var trimmed = name?.Trim() ?? "";
+        if (trimmed.Length == 0)
+            return false;
+
+        CopperBulbRuleSettings? target = null;
+        lock (_bulbsLock)
+        {
+            foreach (var b in AliveBulbs())
+            {
+                if (string.Equals(b.Name, trimmed, StringComparison.Ordinal))
+                {
+                    target = b;
+                    break;
+                }
+            }
+        }
+
+        if (target == null)
+            return false;
+
+        lock (_bulbsLock)
+        {
+            target.IsOn = !target.IsOn;
+        }
+
+        PersistControllerState(target);
+        SchedulePublish(true); // 翻转即需广播，让承载铜灯的元件重估
+        return true;
+    }
+
+    /// <summary>
+    /// 从磁盘加载分配序号（首次访问时）。
+    /// </summary>
+    private void EnsureCounterLoaded()
+    {
+        if (_counterLoaded) return;
+        _counterLoaded = true;
+
+        var path = CounterPath;
+        if (path == null || !File.Exists(path)) return;
+        try
+        {
+            if (BigInteger.TryParse(File.ReadAllText(path).Trim(), NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out var v) && v >= 1)
+            {
+                _nextIndex = v;
+            }
+        }
+        catch
+        {
+            // 损坏则从 1 开始（重名风险由 EnsureName 的冲突跳过兜底）。
+        }
+    }
+
+    /// <summary>
+    /// 把分配序号写回磁盘（原子写入）。调用方须持有 <see cref="_nameLock"/>。
+    /// </summary>
+    private void SaveCounter()
+    {
+        var path = CounterPath;
+        if (path == null) return;
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            var tmpPath = path + ".tmp";
+            File.WriteAllText(tmpPath, _nextIndex.ToString(CultureInfo.InvariantCulture));
+            File.Move(tmpPath, path, true);
+        }
+        catch
+        {
+            // 落盘失败不影响内存计数；下次分配时重试。
+        }
     }
 }

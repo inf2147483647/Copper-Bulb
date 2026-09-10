@@ -22,6 +22,8 @@ public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbR
     /// </summary>
     private const int DarkTextNestingThreshold = 32;
 
+    private readonly TextBox _nameBox;
+    private readonly TextBlock _nameErrorText;
     private readonly TextBlock _titleText;
     private readonly RulesetControl _rulesetControl = new() { ShowTitle = false };
 
@@ -33,6 +35,36 @@ public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbR
             Spacing = 4,
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
+
+        // 名称行：每个铜灯拥有全局唯一的名称，默认 "新铜灯 {N}"。
+        _nameErrorText = new TextBlock
+        {
+            Text = "名称不能为空且不可与其他铜灯重名",
+            IsVisible = false,
+            Foreground = Brushes.Red
+        };
+
+        var nameRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        nameRow.Children.Add(new TextBlock
+        {
+            Text = "名称",
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        _nameBox = new TextBox
+        {
+            Watermark = "新铜灯",
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        _nameBox.TextChanged += (_, _) => _nameErrorText.IsVisible = false;
+        _nameBox.LostFocus += OnNameLostFocus;
+        nameRow.Children.Add(_nameBox);
+        panel.Children.Add(nameRow);
+        panel.Children.Add(_nameErrorText);
 
         _titleText = new TextBlock
         {
@@ -52,10 +84,44 @@ public class CopperBulbRuleSettingsControl : RuleSettingsControlBase<CopperBulbR
         Loaded += OnLoaded;
     }
 
+    /// <summary>
+    /// 名称失焦时校验：空名或重名则还原为上一个有效名称并提示。
+    /// </summary>
+    private void OnNameLostFocus(object? sender, RoutedEventArgs e)
+    {
+        var s = Settings;
+        var inst = CopperBulbService.Instance;
+        if (s == null || inst == null) return;
+
+        if (inst.TryRename(s, _nameBox.Text ?? ""))
+        {
+            _nameErrorText.IsVisible = false;
+            return;
+        }
+
+        // 校验失败：还原显示并提示。
+        _nameBox.Text = s.Name;
+        _nameErrorText.IsVisible = true;
+    }
+
     private void OnLoaded(object? sender, RoutedEventArgs e)
     {
         if (Settings == null) return;
         _rulesetControl.Ruleset = Settings.InternalRuleset;
+
+        // 注册活对象并补分配默认名称（旧配置或新建时 Name 为空）。
+        var inst = CopperBulbService.Instance;
+        if (inst != null)
+        {
+            inst.Register(Settings);
+            var name = inst.EnsureName(Settings);
+            if (_nameBox.Text != name)
+                _nameBox.Text = name;
+        }
+        else if (!string.IsNullOrEmpty(Settings.Name))
+        {
+            _nameBox.Text = Settings.Name;
+        }
 
         var depth = NestingDepth();
 

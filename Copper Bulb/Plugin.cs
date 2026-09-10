@@ -22,6 +22,9 @@ public class Plugin : PluginBase
             "\uEA63",
             CopperBulbService.Handle);
 
+        // “翻转铜灯”行动：按唯一名称指定铜灯，触发时翻转其点亮状态。
+        services.AddAction<CopperBulbFlipAction, CopperBulbFlipActionSettingsControl>();
+
         services.AddHostedService<CopperBulbService>();
     }
 }
